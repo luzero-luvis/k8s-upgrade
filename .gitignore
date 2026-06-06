@@ -1,0 +1,18 @@
+# Ansible inventories (contain server details and credentials)
+ansible/inventory-ssh-setup.ini
+ansible/inventory.ini
+
+# SSH keys
+*.pem
+*.key
+id_*
+!id_*.pub
+
+# Ansible temporary files
+*.retry
+.ansible/
+
+# Editor files
+.vscode/
+*.swp
+*.swo

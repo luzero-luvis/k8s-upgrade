@@ -1,0 +1,35 @@
+---
+# Playbook: add-ssh-key.yaml
+# Pushes your local public key to all servers using password auth.
+#
+# Prerequisites:
+#   1. sshpass installed locally:  sudo apt install sshpass
+#   2. SSH key generated:          ssh-keygen -t ed25519 -f ~/.ssh/k8s_upgrade
+#
+# Usage:
+#   ansible-playbook add-ssh-key.yaml -i ansible/inventory-ssh-setup.ini \
+#     -e "ssh_public_key_path=~/.ssh/k8s_upgrade.pub"
+
+- name: Add SSH public key to all servers
+  hosts: all
+  become: false
+  gather_facts: false
+  vars:
+    ssh_public_key_path: "~/.ssh/k8s_upgrade.pub"
+
+  tasks:
+    - name: "SSH | Ensure .ssh directory exists"
+      file:
+        path: "/home/{{ ansible_user }}/.ssh"
+        state: directory
+        mode: '0700'
+
+    - name: "SSH | Add public key to authorized_keys"
+      authorized_key:
+        user: "{{ ansible_user }}"
+        state: present
+        key: "{{ lookup('file', ssh_public_key_path) }}"
+
+    - name: "SSH | Confirm key added"
+      debug:
+        msg: "Key added to {{ inventory_hostname }} ({{ ansible_host }}) as user {{ ansible_user }}"

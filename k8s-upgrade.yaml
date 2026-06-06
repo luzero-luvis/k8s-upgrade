@@ -1,0 +1,597 @@
+---
+# Playbook: k8s-upgrade.yaml
+# Description: Upgrades the Kubernetes cluster from v1.35.x to v1.36.x using kubeadm.
+#
+# IMPORTANT: Before running this playbook:
+# 1. Review the Kubernetes release notes for v1.36.1
+# 2. Ensure all nodes have swap disabled
+# 3. Test in a non-production environment first
+#
+# NOTE: etcd backup is now automated and runs as part of the 'apply' tag
+#       Backups are stored in /var/lib/etcd-backup/ on each master node
+#
+# RESTORE (if needed):
+#   If the upgrade fails, restore etcd on the master nodes:
+#   1. Stop etcd: mv /var/lib/etcd /var/lib/etcd.old
+#   2. Restore: ETCDCTL_API=3 etcdctl snapshot restore /var/lib/etcd-backup/etcd-snapshot-<timestamp>.db \
+#               --data-dir=/var/lib/etcd
+#   3. Restart kubelet: systemctl restart kubelet
+#
+# Usage:
+#   Dry-run (check mode): ansible-playbook k8s-upgrade.yaml --check --diff
+#   Pre-flight checks: ansible-playbook k8s-upgrade.yaml --tags preflight
+#   Plan only: ansible-playbook k8s-upgrade.yaml --tags plan
+#   Backup etcd only: ansible-playbook k8s-upgrade.yaml --tags backup
+#   Full upgrade (includes backup): ansible-playbook k8s-upgrade.yaml --tags apply,verify
+
+- name: "[Phase 0/6] Pre-flight checks"
+  hosts: all
+  become: true
+  any_errors_fatal: true
+  tags: [preflight]
+  tasks:
+    - name: "Preflight | Check if swap is disabled"
+      shell: "swapon --show | wc -l"
+      register: swap_status
+      changed_when: false
+
+    - name: "Preflight | Verify swap is disabled"
+      assert:
+        that:
+          - swap_status.stdout == "0"
+        fail_msg: "FAIL: Swap is enabled on {{ inventory_hostname }}. Please disable swap before upgrading."
+        success_msg: "OK: Swap is disabled on {{ inventory_hostname }}"
+
+    - name: "Preflight | Get current kubelet version"
+      shell: "kubelet --version | awk '{print $2}'"
+      register: current_kubelet_version
+      changed_when: false
+
+    - name: "Preflight | Display current versions"
+      debug:
+        msg: "Node {{ inventory_hostname }} is currently running kubelet {{ current_kubelet_version.stdout }}"
+
+    - name: "Preflight | Check node status"
+      command: "kubectl get node {{ inventory_hostname }} -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'"
+      delegate_to: "{{ groups['masters'][0] }}"
+      register: node_ready
+      environment:
+        KUBECONFIG: /root/.kube/config
+      changed_when: false
+
+    - name: "Preflight | Verify node is Ready"
+      assert:
+        that:
+          - node_ready.stdout == "True"
+        fail_msg: "FAIL: Node {{ inventory_hostname }} is not in Ready state"
+        success_msg: "OK: Node {{ inventory_hostname }} is Ready"
+
+- name: "[Phase 0.5/6] Backup etcd on all master nodes"
+  hosts: masters
+  become: true
+  any_errors_fatal: true
+  tags: [backup, apply]
+  vars:
+    backup_dir: "/var/lib/etcd-backup"
+    timestamp: "{{ ansible_date_time.iso8601_basic_short }}"
+  tasks:
+    - name: "Backup | Install etcd-client package"
+      apt:
+        name: etcd-client
+        state: present
+        update_cache: yes
+
+    - name: "Backup | Verify etcdctl is installed"
+      command: "etcdctl --version"
+      register: etcdctl_version
+      changed_when: false
+
+    - name: "Backup | Display etcdctl version"
+      debug:
+        msg: "etcdctl version: {{ etcdctl_version.stdout_lines[0] }}"
+
+    - name: "Backup | Create backup directory"
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: "Backup | Create etcd snapshot"
+      shell: |
+        ETCDCTL_API=3 etcdctl snapshot save {{ backup_dir }}/etcd-snapshot-{{ timestamp }}.db \
+          --endpoints=https://127.0.0.1:2379 \
+          --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+          --cert=/etc/kubernetes/pki/etcd/server.crt \
+          --key=/etc/kubernetes/pki/etcd/server.key
+      register: backup_result
+      changed_when: true
+
+    - name: "Backup | Verify snapshot"
+      shell: |
+        ETCDCTL_API=3 etcdctl snapshot status {{ backup_dir }}/etcd-snapshot-{{ timestamp }}.db \
+          --write-out=table
+      register: snapshot_status
+      changed_when: false
+
+    - name: "Backup | Display snapshot status"
+      debug:
+        var: snapshot_status.stdout_lines
+
+    - name: "Backup | Get snapshot file size"
+      stat:
+        path: "{{ backup_dir }}/etcd-snapshot-{{ timestamp }}.db"
+      register: snapshot_file
+
+    - name: "Backup | Display backup location and size"
+      debug:
+        msg:
+          - "etcd backup created successfully on {{ inventory_hostname }}"
+          - "Location: {{ backup_dir }}/etcd-snapshot-{{ timestamp }}.db"
+          - "Size: {{ (snapshot_file.stat.size / 1024 / 1024) | round(2) }} MB"
+
+- name: "[Phase 1/6] Plan the upgrade on the first master node"
+  hosts: masters[0]
+  become: true
+  any_errors_fatal: true
+  tags: [plan, apply]
+  vars:
+    k8s_version: "1.36.1"
+    k8s_short_version: "{{ k8s_version | regex_replace('^(\\d+\\.\\d+).*', 'v\\1') }}"
+    k8s_version_debian: "{{ k8s_version | regex_replace('^v', '') }}"
+
+  tasks:
+    - name: "Master-1 | Unhold kubeadm, kubelet, and kubectl"
+      ansible.builtin.command: "apt-mark unhold kubeadm kubelet kubectl"
+      changed_when: false
+
+    - name: "Master-1 | Add Kubernetes apt keyring"
+      ansible.builtin.shell: "curl -fsSL https://pkgs.k8s.io/core:/stable:/{{ k8s_short_version }}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg --yes"
+
+    - name: "Master-1 | Add Kubernetes apt repository"
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ k8s_short_version }}/deb/ /"
+        state: present
+        filename: kubernetes
+
+    - name: "Master-1 | Update APT cache"
+      ansible.builtin.shell: "apt-get update"
+      retries: 5
+      delay: 10
+      register: apt_update_status
+      until: apt_update_status.rc == 0
+
+    - name: "Master-1 | Install specific version of kubeadm"
+      apt:
+        name: "kubeadm={{ k8s_version_debian }}-1.1"
+        state: present
+        force: yes
+        allow_downgrade: yes
+      notify: Restart kubelet
+
+    - name: "Master-1 | Verify kubeadm version"
+      command: "kubeadm version -o short"
+      register: kubeadm_version
+      changed_when: false
+
+    - name: "Master-1 | Display kubeadm version"
+      debug:
+        msg: "Installed kubeadm version: {{ kubeadm_version.stdout }}"
+
+    - name: "Master-1 | Run 'kubeadm upgrade plan'"
+      command: "kubeadm upgrade plan v{{ k8s_version_debian }}"
+      register: upgrade_plan
+      changed_when: false
+
+    - name: "Master-1 | Display upgrade plan"
+      debug:
+        var: upgrade_plan.stdout_lines
+
+  handlers:
+    - name: Restart kubelet
+      systemd:
+        name: kubelet
+        state: restarted
+        daemon_reload: yes
+
+- name: "[Phase 2/6] Apply the upgrade on the first master node"
+  hosts: masters[0]
+  become: true
+  any_errors_fatal: true
+  tags: [apply]
+  vars:
+    k8s_version: "1.36.1"
+    # The following removes the 'v' prefix if present, e.g., v1.33.0 -> 1.33.0
+    k8s_version_debian: "{{ k8s_version | regex_replace('^v', '') }}"
+
+  tasks:
+    - name: "Master-1 | Pre-pull control plane images"
+      command: "kubeadm config images pull --kubernetes-version v{{ k8s_version_debian }}"
+      register: image_pull
+      changed_when: false
+
+    - name: "Master-1 | Apply the cluster upgrade"
+      command: "kubeadm upgrade apply v{{ k8s_version_debian }} --yes"
+      register: upgrade_apply
+      changed_when: "'UPGRADE/SUCCESS' in upgrade_apply.stdout"
+
+    - name: "Master-1 | Display upgrade apply results"
+      debug:
+        var: upgrade_apply.stdout_lines
+
+    - name: "Master-1 | Install specific versions of kubelet and kubectl"
+      apt:
+        name:
+          - "kubelet={{ k8s_version_debian }}-1.1"
+          - "kubectl={{ k8s_version_debian }}-1.1"
+        state: present
+        force: yes
+        allow_downgrade: yes
+
+    - name: "Master-1 | Refresh kubeconfig after certificate renewal"
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: yes
+        mode: '0600'
+
+    - name: "Master-1 | Reload systemd daemon"
+      systemd:
+        daemon_reload: yes
+
+    - name: "Master-1 | Restart kubelet"
+      systemd:
+        name: kubelet
+        state: restarted
+
+    - name: "Master-1 | Hold kubeadm, kubelet, and kubectl"
+      ansible.builtin.command: "apt-mark hold kubeadm kubelet kubectl"
+      changed_when: false
+
+    - name: "Master-1 | Verify node upgrade"
+      command: "kubectl get node {{ inventory_hostname }} -o jsonpath='{.status.nodeInfo.kubeletVersion}'"
+      register: node_version
+      environment:
+        KUBECONFIG: /root/.kube/config
+      changed_when: false
+
+    - name: "Master-1 | Display node version"
+      debug:
+        msg: "Node {{ inventory_hostname }} is now running kubelet version: {{ node_version.stdout }}"
+
+  handlers:
+    - name: Restart kubelet
+      systemd:
+        name: kubelet
+        state: restarted
+        daemon_reload: yes
+
+- name: "[Phase 3/6] Upgrade additional master nodes"
+  hosts: masters:!masters[0]
+  become: true
+  any_errors_fatal: true
+  serial: 1 # Upgrade secondary masters one by one
+  tags: [apply]
+  vars:
+    k8s_version: "1.36.1"
+    k8s_short_version: "{{ k8s_version | regex_replace('^(\\d+\\.\\d+).*', 'v\\1') }}"
+    k8s_version_debian: "{{ k8s_version | regex_replace('^v', '') }}"
+    master_node: "{{ groups['masters'][0] }}"
+
+  tasks:
+    - name: "Master-X | Drain the node before upgrade"
+      command: "kubectl drain {{ inventory_hostname }} --ignore-daemonsets --delete-emptydir-data"
+      delegate_to: "{{ master_node }}"
+      become: true
+      environment:
+        KUBECONFIG: /root/.kube/config
+      changed_when: false
+
+    - name: "Master-X | Unhold kubeadm, kubelet, and kubectl"
+      ansible.builtin.command: "apt-mark unhold kubeadm kubelet kubectl"
+      changed_when: false
+
+    - name: "Master-X | Add Kubernetes apt keyring"
+      ansible.builtin.shell: "curl -fsSL https://pkgs.k8s.io/core:/stable:/{{ k8s_short_version }}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg --yes"
+
+    - name: "Master-X | Add Kubernetes apt repository"
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ k8s_short_version }}/deb/ /"
+        state: present
+        filename: kubernetes
+
+    - name: "Master-X | Update APT cache"
+      ansible.builtin.shell: "apt-get update"
+      retries: 5
+      delay: 10
+      register: apt_update_status
+      until: apt_update_status.rc == 0
+
+    - name: "Master-X | Install specific version of kubeadm"
+      apt:
+        name: "kubeadm={{ k8s_version_debian }}-1.1"
+        state: present
+        force: yes
+        allow_downgrade: yes
+
+    - name: "Master-X | Verify kubeadm version"
+      command: "kubeadm version -o short"
+      register: kubeadm_version
+      changed_when: false
+
+    - name: "Master-X | Display kubeadm version"
+      debug:
+        msg: "Installed kubeadm version: {{ kubeadm_version.stdout }}"
+
+    - name: "Master-X | Run 'kubeadm upgrade node'"
+      command: "kubeadm upgrade node"
+      register: upgrade_node
+      changed_when: "'upgrade of component \"kubelet\" succeeded' in upgrade_node.stdout or 'The configuration for this node was successfully updated' in upgrade_node.stdout"
+
+    - name: "Master-X | Install specific versions of kubelet and kubectl"
+      apt:
+        name:
+          - "kubelet={{ k8s_version_debian }}-1.1"
+          - "kubectl={{ k8s_version_debian }}-1.1"
+        state: present
+        force: yes
+        allow_downgrade: yes
+
+    - name: "Master-X | Reload systemd daemon"
+      systemd:
+        daemon_reload: yes
+
+    - name: "Master-X | Restart kubelet"
+      systemd:
+        name: kubelet
+        state: restarted
+
+    - name: "Master-X | Uncordon the node"
+      command: "kubectl uncordon {{ inventory_hostname }}"
+      delegate_to: "{{ master_node }}"
+      become: true
+      environment:
+        KUBECONFIG: /root/.kube/config
+      changed_when: false
+
+    - name: "Master-X | Hold kubeadm, kubelet, and kubectl"
+      ansible.builtin.command: "apt-mark hold kubeadm kubelet kubectl"
+      changed_when: false
+
+    - name: "Master-X | Verify node upgrade"
+      command: "kubectl get node {{ inventory_hostname }} -o jsonpath='{.status.nodeInfo.kubeletVersion}'"
+      delegate_to: "{{ master_node }}"
+      register: node_version
+      environment:
+        KUBECONFIG: /root/.kube/config
+      changed_when: false
+
+    - name: "Master-X | Display node version"
+      debug:
+        msg: "Node {{ inventory_hostname }} is now running kubelet version: {{ node_version.stdout }}"
+
+  handlers:
+    - name: Restart kubelet
+      systemd:
+        name: kubelet
+        state: restarted
+        daemon_reload: yes
+
+- name: "[Phase 4/6] Upgrade worker nodes"
+  hosts: workers
+  become: true
+  any_errors_fatal: true
+  serial: 1 # Upgrade nodes one by one
+  tags: [apply]
+  vars:
+    k8s_version: "1.36.1"
+    k8s_short_version: "{{ k8s_version | regex_replace('^(\\d+\\.\\d+).*', 'v\\1') }}"
+    k8s_version_debian: "{{ k8s_version | regex_replace('^v', '') }}"
+    master_node: "{{ groups['masters'][0] }}"
+
+  tasks:
+    - name: "Worker | Unhold kubeadm, kubelet, and kubectl"
+      ansible.builtin.command: "apt-mark unhold kubeadm kubelet kubectl"
+      changed_when: false
+
+    - name: "Worker | Check if node is already cordoned"
+      command: "kubectl get node {{ inventory_hostname }} -o jsonpath='{.spec.unschedulable}'"
+      delegate_to: "{{ master_node }}"
+      become: true
+      register: node_cordoned
+      environment:
+        KUBECONFIG: /root/.kube/config
+      changed_when: false
+
+    - name: "Worker | Drain the node"
+      command: "kubectl drain {{ inventory_hostname }} --ignore-daemonsets --delete-emptydir-data --disable-eviction"
+      delegate_to: "{{ master_node }}"
+      become: true
+      environment:
+        KUBECONFIG: /root/.kube/config
+      when: node_cordoned.stdout != "true"
+
+    - name: "Worker | Add Kubernetes apt keyring"
+      ansible.builtin.shell: "curl -fsSL https://pkgs.k8s.io/core:/stable:/{{ k8s_short_version }}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg --yes"
+
+    - name: "Worker | Add Kubernetes apt repository"
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ k8s_short_version }}/deb/ /"
+        state: present
+        filename: kubernetes
+
+    - name: "Worker | Update APT cache"
+      ansible.builtin.shell: "apt-get update"
+      retries: 5
+      delay: 10
+      register: apt_update_status
+      until: apt_update_status.rc == 0
+
+    - name: "Worker | Install specific version of kubeadm"
+      apt:
+        name: "kubeadm={{ k8s_version_debian }}-1.1"
+        state: present
+        force: yes
+        allow_downgrade: yes
+
+    - name: "Worker | Verify kubeadm version"
+      command: "kubeadm version -o short"
+      register: kubeadm_version
+      changed_when: false
+
+    - name: "Worker | Display kubeadm version"
+      debug:
+        msg: "Installed kubeadm version: {{ kubeadm_version.stdout }}"
+
+    - name: "Worker | Run 'kubeadm upgrade node'"
+      command: "kubeadm upgrade node --ignore-preflight-errors=SystemVerification"
+      register: upgrade_node
+      changed_when: "'upgrade of component \"kubelet\" succeeded' in upgrade_node.stdout or 'The configuration for this node was successfully updated' in upgrade_node.stdout"
+
+    - name: "Worker | Install specific versions of kubelet and kubectl"
+      apt:
+        name:
+          - "kubelet={{ k8s_version_debian }}-1.1"
+          - "kubectl={{ k8s_version_debian }}-1.1"
+        state: present
+        force: yes
+        allow_downgrade: yes
+
+    - name: "Worker | Reload systemd daemon"
+      systemd:
+        daemon_reload: yes
+
+    - name: "Worker | Restart kubelet"
+      systemd:
+        name: kubelet
+        state: restarted
+
+    - name: "Worker | Uncordon the node"
+      command: "kubectl uncordon {{ inventory_hostname }}"
+      delegate_to: "{{ master_node }}"
+      become: true
+      environment:
+        KUBECONFIG: /root/.kube/config
+      changed_when: false
+
+    - name: "Worker | Hold kubeadm, kubelet, and kubectl"
+      ansible.builtin.command: "apt-mark hold kubeadm kubelet kubectl"
+      changed_when: false
+
+    - name: "Worker | Verify node upgrade"
+      command: "kubectl get node {{ inventory_hostname }} -o jsonpath='{.status.nodeInfo.kubeletVersion}'"
+      delegate_to: "{{ master_node }}"
+      register: node_version
+      environment:
+        KUBECONFIG: /root/.kube/config
+      changed_when: false
+
+    - name: "Worker | Display node version"
+      debug:
+        msg: "Node {{ inventory_hostname }} is now running kubelet version: {{ node_version.stdout }}"
+
+  handlers:
+    - name: Restart kubelet
+      systemd:
+        name: kubelet
+        state: restarted
+        daemon_reload: yes
+
+- name: "[Phase 5/6] Verify cluster upgrade"
+  hosts: masters[0]
+  become: true
+  gather_facts: false
+  tags: [verify]
+  vars:
+    expected_version: "v{{ k8s_version }}"
+  tasks:
+    - name: "Verify | Get nodes status"
+      command: kubectl get nodes -o wide
+      register: nodes_status
+      environment:
+        KUBECONFIG: /root/.kube/config
+      changed_when: false
+
+    - name: "Verify | Display nodes status"
+      debug:
+        var: nodes_status.stdout_lines
+
+    - name: "Verify | Check all nodes are Ready"
+      command: kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+      register: nodes_ready
+      environment:
+        KUBECONFIG: /root/.kube/config
+      changed_when: false
+      failed_when: "'False' in nodes_ready.stdout"
+
+    - name: "Verify | Check all nodes are at expected version"
+      shell: |
+        kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.nodeInfo.kubeletVersion}{"\n"}{end}' | \
+        awk '{if ($2 != "{{ expected_version }}") print $0}'
+      register: version_mismatch
+      environment:
+        KUBECONFIG: /root/.kube/config
+      changed_when: false
+
+    - name: "Verify | Display any version mismatches"
+      debug:
+        msg: "{{ version_mismatch.stdout_lines if version_mismatch.stdout_lines | length > 0 else 'All nodes are at version ' + expected_version }}"
+
+    - name: "Verify | Fail if version mismatches detected"
+      fail:
+        msg: "Some nodes are not at the expected version {{ expected_version }}"
+      when: version_mismatch.stdout != ""
+
+    - name: "Verify | Check all pod statuses"
+      command: kubectl get pods --all-namespaces
+      register: pods_status
+      environment:
+        KUBECONFIG: /root/.kube/config
+      changed_when: false
+
+    - name: "Verify | Display pod statuses"
+      debug:
+        var: pods_status.stdout_lines
+
+    - name: "Verify | Check for pods not in Running or Completed state"
+      shell: |
+        kubectl get pods --all-namespaces --field-selector=status.phase!=Running,status.phase!=Succeeded -o wide | tail -n +2
+      register: problematic_pods
+      environment:
+        KUBECONFIG: /root/.kube/config
+      changed_when: false
+      failed_when: false
+
+    - name: "Verify | Display problematic pods if any"
+      debug:
+        msg: "{{ problematic_pods.stdout_lines if problematic_pods.stdout != '' else 'All pods are in Running or Completed state' }}"
+
+    - name: "Verify | Get cluster info"
+      command: kubectl cluster-info
+      register: cluster_info
+      environment:
+        KUBECONFIG: /root/.kube/config
+      changed_when: false
+
+    - name: "Verify | Display cluster info"
+      debug:
+        var: cluster_info.stdout_lines
+
+- name: "[Phase 6/6] Post-upgrade summary"
+  hosts: localhost
+  gather_facts: false
+  tags: [verify]
+  tasks:
+    - name: "Summary | Upgrade complete"
+      debug:
+        msg:
+          - "=========================================="
+          - "Kubernetes cluster upgrade to v{{ k8s_version }} completed successfully!"
+          - "=========================================="
+          - ""
+          - "Next steps:"
+          - "1. Verify your applications are running correctly"
+          - "2. Check monitoring and logging systems"
+          - "3. Update your documentation with the new version"
+          - "4. Consider upgrading your CNI plugin if needed"
+          - ""
+          - "Important: Monitor the cluster for the next 24-48 hours"
